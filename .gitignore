@@ -1,0 +1,36 @@
+# Anlogic TD project files
+*.prj
+*.tdp
+*_Runs/
+out/
+bin/
+*.tcl~
+
+# IDE generated
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Simulation (ModelSim/Questa)
+vsim.ini
+simlib/
+*.vcd
+*.wdb
+
+# Compiled artifacts
+*.so
+*.a
+*.o
+*.obj
+
+# OS generated
+.DS_Store
+Thumbs.db
+
+# SDRAM IP encrypted files (keep these, they're source)
+# src/sdram/enc_file/*.enc.v is included above
+
+# HDI encrypted VHDL (keep these, they're source)
+# src/hdmi/enc_file/*.enc.vhd is included above
