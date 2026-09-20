@@ -9,6 +9,8 @@
 # --- 系统时钟与复位 ---
 set_pin_assignment	{ clk_50 }	{ LOCATION = R7;  IOSTANDARD = LVCMOS33; PULLTYPE = NONE; }
 set_pin_assignment	{ key1 }    { LOCATION = A2;  IOSTANDARD = LVCMOS33; PULLTYPE = NONE; }
+# key2 = 板载按键 2 (BANK3 真差分对 #4 P 端, 板上有上拉, 按下为低)
+set_pin_assignment	{ key2 }    { LOCATION = B2;  IOSTANDARD = LVCMOS33; PULLTYPE = NONE; }
 
 # --- OV5640 摄像头 (DVP 8bit + SCCB) ---
 set_pin_assignment	{ cam_data[0] }	{ LOCATION = P16; IOSTANDARD = LVCMOS33; PULLTYPE = NONE; }

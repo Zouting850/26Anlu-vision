@@ -66,8 +66,32 @@ wire								wr_burst_finish;
 reg App_wr_en_r;
 reg App_wr_en_d0;
 
+reg [BURST_BITS:0]                   burst_need;
 wire into_burst;
-assign into_burst = (((write_len_latch <= (rdusedw + write_cnt))||rdusedw > BURST_SIZE) && ~App_rd_busy);//当rd在突发时不会进入burst
+
+// into_burst 原本写成 `write_len_latch <= (rdusedw + write_cnt)`, 于是 FIFO 指针相减那 5 级
+// ADDER 后面还要串 加 write_cnt(2 级) + 21 位比大小(6 级), 再喂给 O_wr_busy -> 读侧 FSM,
+// 是全设计唯一一条 setup 违例路径 (125MHz 域)。这里把常量差值提前一拍寄出来, 比较降到 10 位。
+// 等价性: len <= rdusedw+cnt <=> rdusedw >= len-cnt; cnt>len 时原式恒真, 故取 0; 差值超过
+// 512 一律饱和, 因为 rdusedw 最大只有 511。
+// 晚一拍不削弱 busy 的预测力: write_cnt 变化后还要经过 S_WRITE_BURST_END 才回 S_CHECK_FIFO,
+// 到 into_burst 真正被使用的那个状态, burst_need 已经稳定。
+localparam [BURST_BITS:0] NEED_MAX = (1 << BURST_BITS);   // 512, 大于 rdusedw 可取到的最大值
+wire [ADDR_BITS-1:0]      burst_need_w = write_len_latch - write_cnt;
+
+always@(posedge mem_clk or posedge rst)
+begin
+	if(rst == 1'b1)
+		burst_need <= NEED_MAX;
+	else if(write_cnt >= write_len_latch)
+		burst_need <= {(BURST_BITS + 1){1'b0}};
+	else if(burst_need_w > {{(ADDR_BITS - BURST_BITS - 1){1'b0}}, NEED_MAX})
+		burst_need <= NEED_MAX;
+	else
+		burst_need <= burst_need_w[BURST_BITS:0];
+end
+
+assign into_burst = (((burst_need <= rdusedw)||(rdusedw > BURST_SIZE)) && ~App_rd_busy);//当rd在突发时不会进入burst
 
 assign App_wr_addr = {App_wr_addr_r[ADDR_BITS - 1:0]};
 //assign O_wr_busy = (state != S_IDLE || (S_IDLE && write_req_d2));

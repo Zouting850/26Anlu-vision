@@ -47,5 +47,8 @@ set_false_path -from [get_clocks {u_video_pll/pll_inst.clkc[1]}] \
                -to   [get_clocks {u_video_pll/pll_inst.clkc[0]}]
 
 # --- 异步复位与准静态信号 ---
+# key1(复位)/key2(模式切换) 都是人手按键: key1 走异步复位, key2 在 ax_debounce
+# 内部已有 2 级同步器, 二者都不需要 pad 时序约束。
 set_false_path -from [get_ports {key1}]
+set_false_path -from [get_ports {key2}]
 set_false_path -from [get_ports {clk_50}] -through [get_nets {Sdr_init_done}]

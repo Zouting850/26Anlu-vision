@@ -1,19 +1,22 @@
 `timescale 1ns / 1ps
 // =============================================================================
-// B板视觉控制系统 — Phase 1: OV5640 → SDRAM → HDMI
+// B板视觉控制系统 — Phase 2: OV5640 → SDRAM(乒乓双缓冲) → YCbCr → HDMI
 // Device: Anlogic EG4S20BG256 (HX4S20C)
 //
 // 数据通路:
 //   ov5640_dri (I2C配置 + DVP采集, RGB565)
 //     → ov5640_delay (RGB565→RGB888, 打包为 {R,G,B,8'd0})
 //     → frame_read_write (写域 cam_pclk / 读域 video_clk 异步仲裁)
+//         ↑ 基址由 frame_buffer_ctrl 按帧提交在 BUF0/BUF1 间交替 (Phase 2 新增)
 //     → sdram (片内 2M×32 SDRAM, EG_PHY_SDRAM_2M_32 hard macro)
-//     → video_timing_data + video_delay → hdmi_tx (VHDL) → TMDS
+//     → display_path (rgb_to_ycbcr BT.601 流水线 + 显示模式 mux + video_delay
+//         PIPE_LAT=2) → hdmi_tx (VHDL) → TMDS
 // =============================================================================
 
 module top (
     input  wire        clk_50,        // 50MHz 晶振
-    input  wire        key1,          // 板载按键, 低有效, 作为外部复位
+    input  wire        key1,          // 板载按键 A2, 低有效, 作为外部复位
+    input  wire        key2,          // 板载按键 B2, 低有效, 切换显示模式
 
     // --- OV5640 ---
     input  wire        cam_pclk,
@@ -38,8 +41,8 @@ module top (
     // --- 分段诊断 (板载 4 颗独立 LED, 高电平点亮, 不依赖 SW6) ---
     output wire        led1,          // A4  SCCB 配置完成
     output wire        led2,          // A3  片内 SDRAM 就绪
-    output wire        led3,          // C10 采集侧每帧心跳
-    output wire        led4           // B12 写通道每帧拿到授权
+    output wire        led3,          // C10 读通道心跳 (SDRAM -> HDMI), 闪 = 读通道在跑完帧
+    output wire        led4           // B12 写通道心跳 (摄像头 -> SDRAM), 闪 = 乒乓在提交
 );
 
 // ---------------------------------------------------------------------------
@@ -51,6 +54,11 @@ localparam [12:0] V_DISP       = 13'd480;
 localparam [12:0] TOTAL_H      = 13'd1856;   // 640 + 1216
 localparam [12:0] TOTAL_V      = 13'd984;    // 480 + 504
 localparam        FRAME_WORDS  = 21'd307200; // 640*480
+
+// 乒乓地址划分: 片内 SDRAM 为 2M×32 = 2,097,152 字 (21bit 字地址),
+// 两块 307200 字共占 29%, 余量够 Phase 3/5 再加灰度缓存或第 3 块缓冲。
+localparam [20:0] BUF0_BASE    = 21'd0;
+localparam [20:0] BUF1_BASE    = 21'd307200;
 
 // ---------------------------------------------------------------------------
 // 1. 复位与时钟
@@ -147,8 +155,23 @@ wire [31:0] Sdr_rd_dout;
 
 wire        hdmi_read_req;
 wire        hdmi_read_req_ack;
+wire        hdmi_read_finish;
 wire        hdmi_read_en;
 wire [31:0] hdmi_read_data;
+
+// 乒乓指针: 全部在 mem_clk 域, 与 frame_read_write 内部采样 *_addr_index 的
+// 时钟同域, 因此不需要跨时钟同步。
+wire        frame_commit;
+wire [1:0]  fb_wr_index;
+wire [1:0]  fb_rd_index;
+
+frame_buffer_ctrl u_fb_ctrl (
+    .mem_clk    (mem_clk),
+    .rst        (sys_rst),
+    .wr_finish  (frame_commit),
+    .wr_index   (fb_wr_index),
+    .rd_index   (fb_rd_index)
+);
 
 frame_read_write #(
     .ADDR_BITS       (21),
@@ -172,30 +195,30 @@ frame_read_write #(
     .App_wr_din       (App_wr_din),
     .App_wr_dm        (App_wr_dm),
 
-    // 写通道: 摄像头
+    // 写通道: 摄像头 (基址随 fb_wr_index 在两块缓冲间交替)
     .write_clk        (cam_pclk),
     .write_req        (cam_write_req),
     .write_req_ack    (cam_write_req_ack),
-    .write_finish     (),
-    .write_addr_0     (21'd0),
-    .write_addr_1     (21'd0),
-    .write_addr_2     (21'd0),
-    .write_addr_3     (21'd0),
-    .write_addr_index (2'd0),
+    .write_finish     (frame_commit),
+    .write_addr_0     (BUF0_BASE),
+    .write_addr_1     (BUF1_BASE),
+    .write_addr_2     (BUF0_BASE),
+    .write_addr_3     (BUF0_BASE),
+    .write_addr_index (fb_wr_index),
     .write_len        (FRAME_WORDS),
     .write_en         (cam_write_en),
     .write_data       (cam_write_data),
 
-    // 读通道: HDMI 显示
+    // 读通道: HDMI 显示 (只读最近一次提交完成的那一帧)
     .read_clk         (video_clk),
     .read_req         (hdmi_read_req),
     .read_req_ack     (hdmi_read_req_ack),
-    .read_finish      (),
-    .read_addr_0      (21'd0),
-    .read_addr_1      (21'd0),
-    .read_addr_2      (21'd0),
-    .read_addr_3      (21'd0),
-    .read_addr_index  (2'd0),
+    .read_finish      (hdmi_read_finish),
+    .read_addr_0      (BUF0_BASE),
+    .read_addr_1      (BUF1_BASE),
+    .read_addr_2      (BUF0_BASE),
+    .read_addr_3      (BUF0_BASE),
+    .read_addr_index  (fb_rd_index),
     .read_len         (FRAME_WORDS),
     .read_en          (hdmi_read_en),
     .read_data        (hdmi_read_data)
@@ -238,20 +261,42 @@ video_timing_data u_video_timing (
     .de           (de_0)
 );
 
-// 摄像头写入格式为 {R,G,B,8'd0}, 故取 [31:8] 而非参考工程 app.v 的 [23:0]
-video_delay #(
-    .DATA_WIDTH (24)
-) u_video_delay (
+// 5.1 key2 (B2) 切换显示模式, 编码见 display_path.v 的 MODE_*:
+//     0=原图 1=灰度 2=YCbCr 假彩 3=彩条(调试档, 不读帧缓冲)
+wire key2_press;
+ax_debounce #(
+    .FREQ (25)                      // video_clk 25MHz
+) u_key2 (
+    .clk           (video_clk),
+    .rst           (sys_rst),
+    .button_in     (key2),
+    .button_posedge(),
+    .button_negedge(key2_press),
+    .button_out    ()
+);
+
+reg [1:0] disp_mode;
+always @(posedge video_clk or posedge sys_rst) begin
+    if (sys_rst)         disp_mode <= 2'd0;                                  // 原图
+    else if (key2_press) disp_mode <= (disp_mode == 2'd3) ? 2'd0 : disp_mode + 2'd1;
+end
+
+// 5.2 显示通路: YCbCr 转换 + 模式选择 + 时序对齐 (详见 src/video/display_path.v)
+display_path #(
+    .DATA_WIDTH (24),
+    .PIPE_LAT   (2)                 // = rgb_to_ycbcr 流水线深度
+) u_disp (
     .video_clk  (video_clk),
     .rst        (sys_rst),
+    .read_data  (hdmi_read_data),
+    .hs_i       (hs_0),
+    .vs_i       (vs_0),
+    .de_i       (de_0),
+    .mode       (disp_mode),
     .read_en    (hdmi_read_en),
-    .read_data  (hdmi_read_data[31:8]),
-    .hs         (hs_0),
-    .vs         (vs_0),
-    .de         (de_0),
-    .hs_r       (hs),
-    .vs_r       (vs),
-    .de_r       (de),
+    .hs_o       (hs),
+    .vs_o       (vs),
+    .de_o       (de),
     .vout_data  (vout_data)
 );
 
@@ -280,36 +325,52 @@ always @(posedge video_clk or posedge sys_rst) begin
     else         blink_cnt <= blink_cnt + 25'd1;
 end
 
-// cmos_frame_vsync / cam_write_req_ack 都是持续多拍的电平, 必须边沿计数
-// 才是"每帧一次"; 直接 if(sig) 会让计数器跑在 pclk 速率上, LED 糊成常亮。
+// cmos_frame_vsync 是持续多拍的电平, 必须边沿计数才是"每帧一次";
+// 直接 if(sig) 会让计数器跑在 pclk 速率上, LED 糊成常亮。
 reg       cam_vsync_d0;
-reg       wr_ack_d0;
 reg [7:0] cam_frame_cnt;
-reg [7:0] cam_grant_cnt;
 always @(posedge cam_pclk or posedge sys_rst) begin
     if (sys_rst) begin
         cam_vsync_d0  <= 1'b0;
-        wr_ack_d0     <= 1'b0;
         cam_frame_cnt <= 8'd0;
-        cam_grant_cnt <= 8'd0;
     end
     else begin
         cam_vsync_d0 <= cmos_frame_vsync;
-        wr_ack_d0    <= cam_write_req_ack;
         if (cmos_frame_vsync & ~cam_vsync_d0)
             cam_frame_cnt <= cam_frame_cnt + 8'd1;
-        if (cam_write_req_ack & ~wr_ack_d0)
-            cam_grant_cnt <= cam_grant_cnt + 8'd1;
     end
 end
 
-// 帧率 = 24MHz/(1856*984) ≈ 13.1fps → bit[2] 每 4 帧翻转 ≈ 1.6Hz 闪,
-// bit[3] 每 8 帧翻转 ≈ 0.8Hz 闪
+// 两条独立心跳, 一边盯乒乓的一半:
+//   led3 = 读通道 (SDRAM -> HDMI): read_finish 每读完一帧一拍 @59.5Hz, /32 翻转 → 0.93Hz
+//   led4 = 写通道 (摄像头 -> SDRAM): frame_commit 每提交一帧一拍 @13.1Hz, /8 翻转 → 0.82Hz
+// 两个计数器都跑在 mem_clk 上 —— 这两个事件本来就是 mem_clk 域的单拍脉冲, 不存在跨域。
+//
+// 为什么改成翻转计数而不是展宽脉冲: 上一版把 commit 展宽到 40ms, 而写帧周期只有 76ms,
+// 占空比 53% —— 肉眼看是"常亮", 把"乒乓在翻页"这个结论整个说反了。翻转计数亮灭各半, 不会骗人。
+//
+// 读通道一旦被 SDRAM 仲裁卡住 (frame_fifo_read 只有在 App_wr_busy=0 时才敢发起突发),
+// led3 会熄灭而 led4 照闪; 两边都闪则说明像素已经送到 display_path 入口,
+// 问题只在转换/HDMI/显示器一侧。
+reg [5:0] rd_hb;
+reg [3:0] wr_hb;
+always @(posedge mem_clk or posedge sys_rst) begin
+    if (sys_rst) begin
+        rd_hb <= 6'd0;
+        wr_hb <= 4'd0;
+    end
+    else begin
+        if (hdmi_read_finish) rd_hb <= rd_hb + 6'd1;
+        if (frame_commit)     wr_hb <= wr_hb + 4'd1;
+    end
+end
+
+// 帧率 = 24MHz/(1856*984) ≈ 13.1fps → bit[3] 每 8 帧翻转 ≈ 0.8Hz 闪
 assign led_hdmi = blink_cnt[24];                              // ~0.75Hz
 assign led_cam  = cam_frame_cnt[3] & cam_init_done;
 assign led1     = cam_init_done;                              // 常亮 = SCCB 表写完
 assign led2     = Sdr_init_done;                              // 常亮 = 片内 SDRAM 就绪
-assign led3     = cam_frame_cnt[2];                           // 闪   = 摄像头在出帧
-assign led4     = cam_grant_cnt[2];                           // 闪   = 帧真的被授权写入
+assign led3     = rd_hb[5];                                   // 闪   = 读通道在跑完整帧
+assign led4     = wr_hb[3];                                   // 闪   = 写通道在提交整帧
 
 endmodule
