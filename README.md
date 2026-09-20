@@ -1,491 +1,92 @@
 # 26Anlu-vision
-# B板视觉控制系统实施方案
 
-## Context
+B 板视觉控制系统 —— 安路 **EG4S20BG256**（康芯 HX4S20C 板）+ **OV5640** 摄像头，
+按 `docs/implementation-plan.md` 分 8 个 Phase 推进：采集 → 片内 SDRAM 帧缓冲 → YCbCr →
+HDMI 显示，再逐级叠加火灾 / 烟雾 / 运动 / 手势识别与通信中转。
 
-基于 HX4S20C 开发板（FPGA: EG4S20BG256）+ OV5640 摄像头，为 B 板设计视觉功能。B 板负责摄像头采集、多种视觉识别，通过 **UART** 向 A 板发送控制指令并中转 PC 应急指令，驱动 A 板的多媒体展示系统智能播放。B 板通过 **ESP32 WiFi 模块**（从A板移植）接收 PC 指令并回传状态。B 板本地通过 **HDMI** 输出摄像头画面及检测结果叠加，方便调试和演示。
+## 当前状态
 
-**已确认**：
-- 板间通信架构：
-  - **ESP32 WiFi 模块**（从A板移植到B板）：PC ↔ ESP32 ↔ FPGA(B板)，双向通信
-    - PC → WiFi → ESP32 → FPGA：PC发送应急指令，B板接收
-    - FPGA → ESP32 → WiFi → PC：B板发送检测结果/状态到PC（调试/监控）
-  - **UART**：FPGA(B板) → A板，发送控制指令
-    - B板将PC应急指令**中转**给A板
-    - B板将自身检测结果也发送给A板
-  - 完整链路：`PC → WiFi → ESP32 → FPGA(B) → UART → A板`
-  - ESP32与FPGA间接口待确认（UART或SPI），代码可直接从A板移植
-- 本地显示：HDMI（摄像头画面 + 检测结果蒙版叠加）
-- B板硬件：HX4S20C 开发板（与参考工程相同，引脚一致）
-- 参考工程不是 A 板代码，仅复用摄像头框架
-- 视觉功能：火灾检测 + 烟雾检测 + 运动检测/人体存在 + 手势方向识别
+| Phase | 内容 | 状态 |
+|---|---|---|
+| 1 | OV5640 → 片内 SDRAM → HDMI 基础通路 | ✅ 上板出图，TD 全流程时序收敛 |
+| 2 | SDRAM 乒乓双缓冲 + BT.601 颜色空间转换 + 显示模式切换 | ✅ 代码与仿真完成；板上已确认灰度档与彩条档，0/2 档与新的读/写心跳 LED 待复看 |
+| 3–8 | 火灾 / 烟雾 / 运动 / 手势 / 通信 / 集成 | 未开始 |
 
-## 系统架构
+## 数据通路
 
 ```
-                    ┌──────────┐
-                    │   PC     │
-                    └────┬─────┘
-                     WiFi│
-                    ┌────┴─────┐
-                    │  ESP32   │ ← 从A板移植
-                    └────┬─────┘
-              UART/SPI │ (待确认接口)
-                       │
-[OV5640] --DVP/I2C--> [B板 FPGA]
-                           |
-              Camera → SDRAM帧缓冲（双缓冲乒乓）
-                           |
-              ┌────────────┼────────────────┐
-              │            │                │
-     ┌────────┴───┐  ┌────┴─────┐  ┌───────┴──────┐
-     │ 火灾/烟雾   │  │ 运动检测  │  │ 手势方向      │
-     │ 检测流水线   │  │ 人体存在  │  │ 识别         │
-     │ (YCbCr阈值) │  │ (帧间差分)│  │ (区域运动分析)│
-     └──────┬─────┘  └────┬─────┘  └──────┬───────┘
-            │              │               │
-            └──────────┬───┘───────────────┘
-                       │
-              检测结果融合 + PC指令中转
-                       │
-                  UART → A板
+ov5640_dri (SCCB 配置 + DVP 采集, RGB565)
+  → ov5640_delay (RGB565→RGB888, 打包 {R,G,B,8'd0})
+  → frame_read_write (写: cam_pclk 域 / 读: video_clk 域, 内部异步 FIFO 仲裁)
+      ↑ 基址由 frame_buffer_ctrl 按帧提交在 BUF0/BUF1 间交替 (0 / 307200 字)
+  → sdram (片内 2M×32, EG_PHY_SDRAM_2M_32 硬宏, 引脚不得写进 .adc)
+  → display_path (rgb_to_ycbcr 两级流水 + 模式 mux + video_delay PIPE_LAT=2 对齐)
+  → hdmi_tx (VHDL, TMDS LVDS)
 ```
 
-**B板FPGA通信职责**：
-1. 接收ESP32转发的PC应急指令 → 解析 → 通过UART中转给A板
-2. 自身视觉检测结果 → 通过UART发送给A板
-3. 自身状态 → 通过ESP32回传给PC（调试/监控）
+关键数字：显示 640×480@59.5Hz（25MHz / 800×525），采集 1856×984@24MHz ≈ **13.1fps**，
+一帧 307200 字 = `BURST_SIZE(256)` 的整数倍（这条必须成立，否则最后一轮突发会越界写进
+另一块缓冲），两块共占片内 SDRAM 的 29%。**读比写快 4.6 倍**是双缓冲不撕裂的依据：
+写指针绕回读侧正在显示的那一块时，读头始终领先。
 
-所有视觉功能共享 YCbCr 转换流水线，利用双缓冲 SDRAM 的当前帧/前一帧数据。
+## 板级判据（上电后一眼能读的东西）
 
-## 项目目录结构
+| 丝印 | 球号 | 含义 |
+|---|---|---|
+| led1 | A4 | 常亮 = OV5640 SCCB 配置表写完 |
+| led2 | A3 | 常亮 = 片内 SDRAM 初始化完成 |
+| led3 | C10 | **闪 0.93Hz = 读通道活着**（每读完一帧翻转一次，59.5Hz/32） |
+| led4 | B12 | **闪 0.82Hz = 写通道在提交整帧**（13.1Hz/8） |
+| dled | A8 / A7 | 摄像头出帧 / 显示时序心跳，各约 0.8Hz |
 
-```
-D:\TD\26Anlu\26Anlu-vision\
-├── top.v                              # 顶层模块
-├── top.sdc                            # 时序约束
-├── top.adc                            # 引脚约束（复用参考工程）
-├── 26Anlu-vision.al                   # Anlogic TD工程文件
-│
-├── src\
-│   ├── camera\                        # 摄像头驱动（复用）
-│   │   ├── ov5640_dri.v
-│   │   ├── i2c_dri.v
-│   │   ├── i2c_ov5640_rgb565_cfg.v
-│   │   ├── cmos_capture_data.v
-│   │   └── ov5640_delay.v            # 修改：适配视觉流水线
-│   │
-│   ├── memory\                        # 存储（复用+修改）
-│   │   ├── sdram.v                    # SDRAM控制器（复用）
-│   │   ├── sdr_as_ram.enc.v
-│   │   ├── frame_read_write.v         # 修改：双缓冲+多读通道
-│   │   ├── frame_fifo_write.v
-│   │   └── frame_fifo_read.v
-│   │
-│   ├── comm\                          # 板间通信（新增）
-│   │   ├── uart_tx.v                  # UART发送模块（B板→A板）
-│   │   ├── uart_rx.v                  # UART接收模块（ESP32→B板，接收PC指令）
-│   │   ├── esp32_if.v                # ESP32接口模块（从A板移植/适配）
-│   │   ├── cmd_sender.v             # B板→A板：检测结果打包+发送
-│   │   └── cmd_relay.v              # PC指令中转：接收→解析→转发给A板
-│   │
-│   ├── vision\                        # 视觉处理（全部新增）
-│   │   ├── rgb_to_ycbcr.v             # 颜色空间转换（共享基础）
-│   │   ├── line_buffer.v              # 复用：3x3滑动窗口
-│   │   ├── sobel_process.v            # 复用：边缘检测
-│   │   │
-│   │   ├── fire_detector.v            # 火焰检测核心
-│   │   ├── fire_region_analyzer.v     # 火焰区域统计
-│   │   │
-│   │   ├── smoke_detector.v           # 烟雾检测核心
-│   │   ├── smoke_region_analyzer.v    # 烟雾区域统计
-│   │   │
-│   │   ├── motion_detector.v          # 运动检测（帧间差分）
-│   │   ├── presence_analyzer.v        # 人体存在判定
-│   │   │
-│   │   └── gesture_recognizer.v       # 手势方向识别
-│   │
-│   ├── video\                         # 本地显示（复用）
-│   │   ├── video_timing_data.v
-│   │   ├── video_delay.v
-│   │   └── hdmi_tx.enc.v
-│   │
-│   └── util\                          # 工具模块（复用）
-│       ├── debounce.v
-│       └── led.v
-│
-├── ip\                                # Anlogic IP核（复用）
-│   ├── sys_pll.v
-│   ├── video_pll.v
-│   └── line_ram_640x8.v
-│
-└── sim\                               # 仿真测试
-    ├── tb_fire_detector.v
-    ├── tb_motion_detector.v
-    └── tb_rgb_to_ycbcr.v
+指示器一律用**事件翻转计数**，不用"展宽脉冲"：亮灭各半才可判读，展宽脉冲的占空比一旦
+接近 50% 肉眼看就是常亮（这一条本项目踩过坑）。
+
+`key2`(B2) 切显示档位，`key1`(A2) 复位：
+
+| 档位 | 显示 | 数据来源 |
+|---|---|---|
+| 0 | 原图 RGB | 帧缓冲 |
+| 1 | 灰度（77R+150G+29B） | 帧缓冲 |
+| 2 | 伪彩 R=Y, G=Cb, B=Cr | 帧缓冲 |
+| 3 | **8 列彩条** | 内部计数器，完全绕开帧缓冲 |
+
+第 3 档是调试档：它把"HDMI/显示器/同步这条链路是否活着"与"帧缓冲内容对不对"分开判断。
+彩条按 `read_en` 计数（与显示像素同序），按 `de_i` 计会超前流水线深度而在行首行尾露白。
+
+## 回归
+
+```bash
+sh sim/run_all.sh          # 需要 D:/iverilog/iverilog/bin 在 PATH 里
 ```
 
-## 关键模块设计
-
-### 1. RGB→YCbCr 颜色空间转换 (`rgb_to_ycbcr.v`)
-
-所有视觉功能共享此转换模块。从参考工程 `udp_cam_ctrl.v:319-322` 提取系数，2级流水线：
-
-```
-S1（组合逻辑乘法+寄存输出）:
-  Y_pre  = 66*R + 129*G + 25*B
-  Cb_pre = -38*R - 74*G + 112*B + 28672
-  Cr_pre = 112*R - 94*G - 18*B + 28672
-  gray   = 77*R + 150*G + 29*B
-
-S2（移位+偏移+钳位）:
-  Y  = (Y_pre >> 8) + 16,  钳位[16,235]
-  Cb = (Cb_pre >> 8),      钳位[16,240]
-  Cr = (Cr_pre >> 8),      钳位[16,240]
-```
-
-输出 Y、Cb、Cr、gray 四路信号，供下游所有检测模块并行使用。
-
-### 2. 火焰检测 (`fire_detector.v` + `fire_region_analyzer.v`)
-
-**逐像素检测**（`fire_detector.v`）：
-
-| 条件 | 判断 | 说明 |
-|------|------|------|
-| 亮度 | Y >= 180 | 火焰高亮度 |
-| 红色色度 | Cr >= 155 | 火焰高红色色度 |
-| 蓝色色度 | Cb <= 120 | 火焰低蓝色色度 |
-| R > G | 红通道 > 绿通道 | 火焰偏红 |
-| R > B | 红通道 > 蓝通道 | 火焰暖色调 |
-
-可选空间验证（使用 `line_buffer.v` 3x3窗口）：邻域 >= 3 像素同为候选 → 确认。
-
-**区域统计**（`fire_region_analyzer.v`）：
-- 帧级累加：火焰像素计数、质心坐标（sum_x, sum_y）
-- 帧结束输出：`fire_ratio`（占比）、`fire_cx/cy`（质心）、`fire_alarm`（报警）
-
-### 3. 烟雾检测 (`smoke_detector.v` + `smoke_region_analyzer.v`)
-
-**检测原理**：烟雾在 YCbCr 空间的特征为低饱和度（Cb、Cr 接近128）+ 中等亮度 + 区域随时间扩散。
-
-**逐像素检测**（`smoke_detector.v`）：
-
-| 条件 | 判断 | 说明 |
-|------|------|------|
-| 低饱和度 | abs(Cb - 128) < 20 且 abs(Cr - 128) < 20 | 烟雾颜色接近中性灰 |
-| 中等亮度 | 80 < Y < 220 | 烟雾既不太暗也不太亮 |
-| 灰度特征 | abs(Cb - Cr) < 15 | Cb和Cr接近，低彩色 |
-| 亮度变化 | 与前一帧同位置像素亮度差 < 30 | 烟雾是缓慢变化的（需帧缓冲配合） |
-
-**区域统计**（`smoke_region_analyzer.v`）：
-- 低饱和度区域计数 `smoke_count`
-- 与前一帧的烟雾区域对比：新增面积 `smoke_growth`
-- 帧结束输出：`smoke_ratio`（占比）、`smoke_growth_rate`（扩散速率）、`smoke_alarm`
-
-**判定逻辑**：
-- 大面积低饱和度区域 + 持续扩散 → 烟雾报警
-- 单纯低饱和度但不扩散（如灰色墙壁）→ 不报警
-
-### 4. 运动检测 / 人体存在 (`motion_detector.v` + `presence_analyzer.v`)
-
-**检测原理**：利用 SDRAM 双缓冲，当前帧灰度 vs 前一帧灰度，逐像素差分。
-
-**帧间差分**（`motion_detector.v`）：
-
-```
-输入：当前帧 gray_curr[7:0]，前一帧 gray_prev[7:0]（从SDRAM另一bank读取）
-处理：diff = abs(gray_curr - gray_prev)
-      motion_pixel = (diff > motion_thresh) ? 1 : 0    // motion_thresh 默认 20
-输出：motion_mask（二值运动掩码）
-```
-
-SDRAM 读取策略：视觉流水线读取当前帧用于火灾/烟雾检测的同时，运动检测模块读取前一帧对应位置的灰度值。可通过共享 `line_buffer` 延迟一行来实现帧对齐，或在 SDRAM 中额外开辟一行缓冲。
-
-**人体存在判定**（`presence_analyzer.v`）：
-- 帧级累加运动像素数 `motion_count`
-- 计算运动比例 `motion_ratio = motion_count / (640*480)`
-- 滑动窗口平滑（最近 N 帧平均）
-- 输出：
-  - `presence_detected`：有人存在（motion_ratio > 阈值，如 1%）
-  - `motion_level[7:0]`：运动强度等级（0=静止，255=剧烈运动）
-  - `presence_duration[15:0]`：持续存在时间（用于判断"停留"vs"路过"）
-
-### 5. 手势方向识别 (`gesture_recognizer.v`)
-
-**检测原理**：将画面分为左右两个区域，比较各区域的运动能量，判断运动方向。
-
-```
-┌──────────┬──────────┐
-│          │          │
-│  左区域   │  右区域   │
-│  x:0-319 │  x:320-639│
-│          │          │
-└──────────┴──────────┘
-```
-
-**实现**（`gesture_recognizer.v`）：
-
-```
-每帧处理：
-  left_motion  = 左区域运动像素累加
-  right_motion = 右区域运动像素累加
-
-  方向判定：
-    if left_motion > right_motion * 2  →  "向左运动" (swipe_left)
-    if right_motion > left_motion * 2  →  "向右运动" (swipe_right)
-    if both > threshold                →  "靠近/远离" (需上下区域配合)
-
-  去抖：连续 3 帧同方向才确认手势
-  冷却：手势确认后 500ms 内不重复触发
-```
-
-输出：
-- `gesture_type[2:0]`：0=无，1=左划，2=右划，3=上划，4=下划
-- `gesture_valid`：手势有效标志（脉冲）
-- `gesture_confidence[7:0]`：置信度
-
-**对应A板控制**：
-- 左划 → A板播放下一个内容
-- 右划 → A板播放上一个内容
-- 上划 → A板放大/切换详情
-- 下划 → A板缩小/返回列表
-
-### 6. 通信模块（双通道：ESP32↔PC + UART→A板）
-
-B板有两条通信通道：
-- **ESP32通道**（从A板移植）：接收PC应急指令 + 向PC回传状态
-- **UART通道**（B板→A板）：发送检测结果 + 中转PC指令
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                    B板 FPGA                              │
-│                                                         │
-│  ┌──────────────┐     ┌──────────────┐                  │
-│  │ esp32_if.v   │     │ cmd_sender.v │                  │
-│  │ (ESP32接口)  │     │ (检测结果打包)│                  │
-│  │ 从A板移植     │     │              │                  │
-│  └──────┬───────┘     └──────┬───────┘                  │
-│         │ 接收PC指令          │ 检测结果字节流             │
-│         ▼                    ▼                          │
-│  ┌──────────────┐     ┌──────────────┐                  │
-│  │ cmd_relay.v  │     │  uart_tx.v   │                  │
-│  │ (指令解析+    │────▶│  (UART发送)   │──── UART ──▶ A板 │
-│  │  中转)        │     │              │                  │
-│  └──────────────┘     └──────────────┘                  │
-│         ▲                                               │
-│  ┌──────┴───────┐                                      │
-│  │  uart_rx.v   │                                      │
-│  │ (UART接收    │◀── UART/SPI ── ESP32                 │
-│  │  ESP32数据)  │                                      │
-│  └──────────────┘                                      │
-└─────────────────────────────────────────────────────────┘
-```
-
-#### 6.1 `esp32_if.v` — ESP32接口（从A板移植/适配）
-
-此模块从A板已有的ESP32通信代码移植，负责FPGA与ESP32之间的数据交换。
-- 具体接口方式（UART/SPI）待ESP32模块资料确认后确定
-- 移植时需适配B板的引脚分配和时钟域
-
-#### 6.2 `uart_rx.v` — UART接收（ESP32→FPGA）
-
-接收ESP32转发的PC指令：
-- 波特率：与ESP32配置匹配（待确认）
-- 帧格式：1起始位 + 8数据位 + 1停止位
-- 输出：接收到的字节流给 `cmd_relay.v`
-
-#### 6.3 `cmd_relay.v` — PC指令解析与中转
-
-```
-功能：
-1. 接收ESP32通道传来的PC指令字节流
-2. 解析协议帧（帧头检测 + 长度 + 数据 + 校验）
-3. 将有效指令重新打包后通过UART发送给A板
-4. 可选：B板自身也对部分指令做响应（如切换检测模式）
-
-PC指令类型（待A板协议文档确认后完善）：
-- 应急控制指令：直接透传给A板
-- B板配置指令：修改检测阈值、切换模式等（B板自身处理）
-```
-
-#### 6.4 `cmd_sender.v` — B板检测结果发送
-
-**协议帧格式**（B板→A板）：
-
-```
-| 帧头(2B) | 类型(1B) | 长度(1B) | 数据(NB) | CRC8(1B) |
-|  0xAA55  |   cmd   |   len   | payload  |  crc8   |
-```
-
-**指令类型定义**：
-
-| cmd | 名称 | payload | 说明 |
-|-----|------|---------|------|
-| 0x01 | 心跳 | status[7:0] | 每100ms，含系统状态 |
-| 0x02 | 火灾报警 | severity, ratio | 状态变化时+活跃期每200ms |
-| 0x03 | 火焰坐标 | cx_h, cx_l, cy_h, cy_l | 每帧发送（有火时） |
-| 0x04 | 烟雾报警 | severity, ratio, growth_rate | 状态变化时+活跃期每500ms |
-| 0x05 | 运动状态 | presence, motion_level | 每帧发送 |
-| 0x06 | 手势识别 | gesture_type, confidence | 手势发生时立即发送 |
-| 0x07 | 播放控制 | mode, param | 综合判断后的播放指令 |
-| 0x08 | 场景类型 | scene_id, confidence | 综合场景分类 |
-| 0xF0 | PC指令中转 | original_cmd, original_payload | 透传PC发给A板的指令 |
-
-**发送调度**：
-- 优先级：火灾报警 > 烟雾报警 > 手势 > PC指令中转 > 播放控制 > 运动状态 > 心跳
-- 心跳：固定100ms
-- 报警类：状态变化立即发送 + 活跃期重复
-- 手势：触发即发
-- PC指令中转：收到即转发
-- 状态类：每帧处理完成后发送
-
-#### 6.5 `uart_tx.v` — UART发送（FPGA→A板）
-
-标准UART发送模块：
-- 波特率：115200（参数化，可配置至921600）
-- 帧格式：1起始位 + 8数据位 + 1停止位，无校验
-- 时钟：系统50MHz，分频产生波特率
-
-### 7. SDRAM多缓冲策略
-
-利用 `frame_read_write.v` 已有的多bank地址选择机制：
-
-```
-Bank A (0x00000-0x4BFFF): 帧缓冲A (640x480 x 32bit)
-Bank B (0x4C000-0x97FFF): 帧缓冲B
-
-帧N:   摄像头写Bank A
-       视觉流水线读Bank A（当前帧处理）
-       运动检测读Bank B（前一帧，用于帧间差分）
-帧N+1: 摄像头写Bank B
-       视觉流水线读Bank B
-       运动检测读Bank A
-vsync时交换bank角色
-```
-
-带宽分析（100MHz, 32bit = 400MB/s）：
-- 摄像头写入: 36.8 MB/s (9.2%)
-- 视觉读取（当前帧）: 36.8 MB/s (9.2%)
-- 运动检测读取（前一帧）: 36.8 MB/s (9.2%)
-- 总计 ~28%，远低于SDRAM带宽上限
-
-## 需要修改的现有模块
-
-| 模块 | 修改内容 | 源文件 |
-|------|---------|--------|
-| `ov5640_delay.v` | 适配视觉流水线写请求 | `import/ov5640_delay.v` |
-| `frame_read_write.v` | 增加视觉读通道+运动检测读通道，双缓冲仲裁 | `src/frame_read_write.v` |
-
-## 复用的现有模块（不修改）
-
-| 模块 | 源路径 |
-|------|--------|
-| `ov5640_dri.v` | `import/ov5640_dri.v` |
-| `i2c_dri.v` | `import/i2c_dri.v` |
-| `i2c_ov5640_rgb565_cfg.v` | `import/i2c_ov5640_rgb565_cfg.v` |
-| `cmos_capture_data.v` | `import/cmos_capture_data.v` |
-| `sdram.v` + `sdr_as_ram.enc.v` | `lab_ex_6/.../sdram/` |
-| `frame_fifo_write.v` | `src/frame_fifo_write.v` |
-| `frame_fifo_read.v` | `src/frame_fifo_read.v` |
-| `line_buffer.v` | `import/line_buffer.v` |
-| `sobel_process.v` | `import/sobel_process.v` |
-| `video_timing_data.v` | `src/video_timing_data.v` |
-| `video_delay.v` | `src/video_delay.v` |
-| `hdmi_tx.enc.v` | `hdmi/` |
-| `sys_pll.v` / `video_pll.v` | `lab_ex_6/.../al_ip/` |
-| `debounce.v` | 参考工程 |
-| `led.v` | `import/led.v` |
-
-## 实施阶段
-
-### Phase 1: 工程骨架 + 摄像头点亮
-- 创建Anlogic TD工程，设备EG4S20BG256
-- 复制所有可复用IP/加密核到项目目录
-- 创建 `top.v`：摄像头 → SDRAM → HDMI 基础通路
-- 引脚约束从参考工程复制
-- **验证**: HDMI上看到摄像头实时画面
-
-### Phase 2: SDRAM双缓冲 + 颜色空间转换
-- 修改 `frame_read_write.v` 支持双bank乒乓缓冲
-- 实现 `rgb_to_ycbcr.v`，仿真验证
-- **验证**: 双缓冲正常工作，YCbCr转换波形正确
-
-### Phase 3: 火灾检测
-- 实现 `fire_detector.v` + `fire_region_analyzer.v`
-- 仿真：注入合成火焰图像
-- HDMI叠加显示火焰检测蒙版（红色）
-- **验证**: 对真实火焰（蜡烛/打火机）有响应
-
-### Phase 4: 烟雾检测
-- 实现 `smoke_detector.v` + `smoke_region_analyzer.v`
-- 仿真：注入合成烟雾图像（灰色扩散区域）
-- HDMI叠加显示烟雾检测蒙版（灰色半透明）
-- **验证**: 对真实烟雾有响应，灰色墙壁不误报
-
-### Phase 5: 运动检测 + 人体存在
-- 实现 `motion_detector.v` + `presence_analyzer.v`
-- 仿真：注入前后帧差异图像
-- HDMI叠加显示运动掩码（绿色轮廓）
-- **验证**: 人走过画面时检测到运动，静止时无人存在标志
-
-### Phase 6: 手势方向识别
-- 实现 `gesture_recognizer.v`
-- 依赖 Phase 5 的运动检测输出
-- 仿真：注入左右方向运动序列
-- HDMI叠加显示手势识别结果（方向箭头）
-- **验证**: 左右挥手能正确识别方向
-
-### Phase 7: 通信模块
-- 实现 `uart_tx.v`（B板→A板UART发送）
-- 实现 `uart_rx.v`（ESP32→B板UART接收）
-- 实现 `cmd_sender.v`（检测结果打包+优先级调度）
-- 实现 `cmd_relay.v`（PC指令解析+中转给A板）
-- 待ESP32模块资料到位后：移植 `esp32_if.v` 并适配
-- 先用PC串口助手模拟ESP32，验证指令接收和中转逻辑
-- **验证**: 串口助手正确接收B板检测结果；模拟PC指令能正确中转给A板
-
-### Phase 8: 系统集成 + 调优
-- 全链路：摄像头 → 4种视觉检测 → 通信模块 → A板（待A板就绪）
-- HDMI多色叠加显示：红色=火焰，灰色=烟雾，绿色=运动，蓝色=手势
-- 阈值调优（真实场景）
-- 压力测试：连续运行数小时
-- 时序收敛验证
-- 按键控制：检测模式切换、阈值调节
-- LED指示：各检测状态
-
-## 资源估算
-
-| 资源 | 估算用量 | FPGA总量 | 占比 |
-|------|---------|---------|------|
-| LUT4 | ~4,500 | ~20,000 | ~22.5% |
-| FF | ~3,500 | ~20,000 | ~17.5% |
-| BRAM | 4 (line_buffer x2 + 帧灰度缓存) | -- | 中等 |
-
-各检测模块共享 YCbCr 转换，增量资源主要来自比较器和累加器，整体资源占用可控。
-
-## HDMI叠加显示方案
-
-在HDMI输出上叠加各检测结果，方便调试和演示：
-
-| 检测结果 | 叠加颜色 | 叠加方式 |
-|---------|---------|---------|
-| 火焰像素 | 红色 (R=255, G=0, B=0) | 半透明覆盖 |
-| 烟雾区域 | 灰色 (R=128, G=128, B=128) | 半透明覆盖 |
-| 运动区域 | 绿色轮廓 (R=0, G=255, B=0) | 边缘描线 |
-| 手势方向 | 蓝色箭头 | 画面中央叠加 |
-| 系统状态 | 左上角文字区 | 帧率、各检测状态、UART发送计数 |
-
-## 验证方法
-
-1. **仿真验证**: 对 `rgb_to_ycbcr`、`fire_detector`、`motion_detector` 做单元仿真
-2. **HDMI视觉验证**: 多色叠加显示，用真实火焰/烟雾/手势场景测试
-3. **通信验证**: PC串口助手模拟ESP32/A板，验证B板检测结果发送和PC指令中转
-4. **端到端验证**: A板根据B板指令切换多媒体内容（待A板就绪）
-5. **压力测试**: 连续运行24小时以上
-
-## 需要用户补充的材料
-
-1. **ESP32 WiFi 模块资料** — A板已有的ESP32通信代码（用于移植）、FPGA与ESP32间接口方式（UART/SPI）、引脚连接
-2. **A板资料** — A板的Verilog工程或协议文档，用于对接UART通信和播放控制逻辑
-3. **A板多媒体内容组织方式** — TF卡中图片如何命名/分组？A板支持哪些播放切换指令？
-4. **UART/SPI引脚确认** — B板使用哪个GPIO连接器引出与ESP32和A板的通信引脚？需确认原理图可用引脚
+- 第 0 步按 `26Anlu-vision.al` 自己的文件清单跑 iverilog 并扫 "Unknown module"，等价于 TD 的
+  black box 检查（加密 IP 与 TD 生成的 `ip/*.v` 用 `sim/lint_stubs.v` 顶替）
+- `tb_rgb_to_ycbcr`：4264 像素逐位比对，值域实测 Y[16,235] Cb/Cr[16,240] gray[0,255]
+- `tb_frame_buffer_ctrl`：按真实读写速率比建模，代标记分板 + 无撕裂判据
+- `tb_display_path`：**真实** `frame_read_write` + 真实异步 FIFO 的端到端像素对齐，
+  四档全过，并断言 `App_wr_en` 与 `App_rd_en` 永不同拍（仲裁互斥被破坏时，像素位置/颜色
+  检查全都发现不了，只有这条能报）
+
+`src/sdram/enc_file/*.enc.v`、`src/hdmi/enc_file/*.enc.vhd` 是加密 IP，iverilog 读不了，
+所以只有纯 RTL 部分能本地仿真。
+
+## 时序
+
+125MHz（`mem_clk`）域现在 SWNS **+0.919ns**、0 违例端点、Fmax 141.2MHz，hold +0.105ns。
+这条曾经是 `frame_fifo_write` 里 `write_len_latch <= (rdusedw + write_cnt)` 一个表达式造成的：
+FIFO 指针相减的 5 级 ADDER 后面又串了 2 级加法 + 21 位幅值比较，直达读侧 FSM。改法见
+`src/memory/frame_fifo_write.v` 注释。报告位置：`26Anlu-vision_Runs/syn_1/run.log`（登记与
+black box）、`phy_1/final_timing.rpt`（逐端点单元/网络延迟表）。
+
+## 已知残留
+
+读侧基址在 `S_ACK` 那拍锁存，而 `rd_index` 要先过 2 级同步，所以提交若落在该 16ns 窗口内，
+那次读会锁到旧索引 → 读到正在被写的那块，出现**一帧**撕裂，下一帧自愈。按 59.5 帧/s × 16ns ×
+13.1 次提交/s 估算约 **22 小时一次**。单独为它上第 3 块缓冲不划算；Phase 3/5 加视觉/运动读通道
+时本来要复制 `frame_fifo_read` + 读 FIFO，那时顺手把 3 缓冲一起上（`read_addr_2` 槽位现成）。
+
+## 相关文档
+
+- `docs/implementation-plan.md` —— 完整实施方案：系统架构、各检测算法的定点化设计、
+  引脚与通信协议、8 个 Phase 的目标与验收判据、资源估算
