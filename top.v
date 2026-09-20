@@ -33,7 +33,13 @@ module top (
 
     // --- 状态指示 ---
     output wire        led_cam,       // 摄像头出帧
-    output wire        led_hdmi       // HDMI 时序运行
+    output wire        led_hdmi,      // HDMI 时序运行
+
+    // --- 分段诊断 (板载 4 颗独立 LED, 高电平点亮, 不依赖 SW6) ---
+    output wire        led1,          // A4  SCCB 配置完成
+    output wire        led2,          // A3  片内 SDRAM 就绪
+    output wire        led3,          // C10 采集侧每帧心跳
+    output wire        led4           // B12 写通道每帧拿到授权
 );
 
 // ---------------------------------------------------------------------------
@@ -274,13 +280,36 @@ always @(posedge video_clk or posedge sys_rst) begin
     else         blink_cnt <= blink_cnt + 25'd1;
 end
 
-reg [3:0] cam_frame_cnt;
+// cmos_frame_vsync / cam_write_req_ack 都是持续多拍的电平, 必须边沿计数
+// 才是"每帧一次"; 直接 if(sig) 会让计数器跑在 pclk 速率上, LED 糊成常亮。
+reg       cam_vsync_d0;
+reg       wr_ack_d0;
+reg [7:0] cam_frame_cnt;
+reg [7:0] cam_grant_cnt;
 always @(posedge cam_pclk or posedge sys_rst) begin
-    if (sys_rst)            cam_frame_cnt <= 4'd0;
-    else if (cmos_frame_vsync) cam_frame_cnt <= cam_frame_cnt + 4'd1;  // 每帧翻转低位
+    if (sys_rst) begin
+        cam_vsync_d0  <= 1'b0;
+        wr_ack_d0     <= 1'b0;
+        cam_frame_cnt <= 8'd0;
+        cam_grant_cnt <= 8'd0;
+    end
+    else begin
+        cam_vsync_d0 <= cmos_frame_vsync;
+        wr_ack_d0    <= cam_write_req_ack;
+        if (cmos_frame_vsync & ~cam_vsync_d0)
+            cam_frame_cnt <= cam_frame_cnt + 8'd1;
+        if (cam_write_req_ack & ~wr_ack_d0)
+            cam_grant_cnt <= cam_grant_cnt + 8'd1;
+    end
 end
 
-assign led_hdmi = blink_cnt[24];                              // ~1Hz
-assign led_cam  = cam_frame_cnt[3] & cam_init_done;           // 摄像头初始化完成且有帧
+// 帧率 = 24MHz/(1856*984) ≈ 13.1fps → bit[2] 每 4 帧翻转 ≈ 1.6Hz 闪,
+// bit[3] 每 8 帧翻转 ≈ 0.8Hz 闪
+assign led_hdmi = blink_cnt[24];                              // ~0.75Hz
+assign led_cam  = cam_frame_cnt[3] & cam_init_done;
+assign led1     = cam_init_done;                              // 常亮 = SCCB 表写完
+assign led2     = Sdr_init_done;                              // 常亮 = 片内 SDRAM 就绪
+assign led3     = cam_frame_cnt[2];                           // 闪   = 摄像头在出帧
+assign led4     = cam_grant_cnt[2];                           // 闪   = 帧真的被授权写入
 
 endmodule

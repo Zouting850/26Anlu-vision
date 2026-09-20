@@ -33,6 +33,12 @@ set_pin_assignment	{ HDMI_D0_P }	{ LOCATION = F5; IOSTANDARD = LVDS33; PULLTYPE 
 set_pin_assignment	{ HDMI_D1_P }	{ LOCATION = E3; IOSTANDARD = LVDS33; PULLTYPE = NONE; }
 set_pin_assignment	{ HDMI_D2_P }	{ LOCATION = B3; IOSTANDARD = LVDS33; PULLTYPE = NONE; }
 
-# --- 状态指示 LED (板载 dled 阵列中的两颗) ---
+# --- 状态指示 LED (板载 dled 阵列中的两颗, 需 SW6 拨到双色 LED 侧) ---
 set_pin_assignment	{ led_cam }	{ LOCATION = A8; IOSTANDARD = LVCMOS33; DRIVESTRENGTH = 8; PULLTYPE = NONE; }
 set_pin_assignment	{ led_hdmi }	{ LOCATION = A7; IOSTANDARD = LVCMOS33; DRIVESTRENGTH = 8; PULLTYPE = NONE; }
+
+# --- 分段诊断 LED (板载 4 颗独立 LED, BANK0/3.3V, 高电平点亮, 与 SW6 无关) ---
+set_pin_assignment	{ led1 }	{ LOCATION = A4;  IOSTANDARD = LVCMOS33; DRIVESTRENGTH = 8; PULLTYPE = NONE; }
+set_pin_assignment	{ led2 }	{ LOCATION = A3;  IOSTANDARD = LVCMOS33; DRIVESTRENGTH = 8; PULLTYPE = NONE; }
+set_pin_assignment	{ led3 }	{ LOCATION = C10; IOSTANDARD = LVCMOS33; DRIVESTRENGTH = 8; PULLTYPE = NONE; }
+set_pin_assignment	{ led4 }	{ LOCATION = B12; IOSTANDARD = LVCMOS33; DRIVESTRENGTH = 8; PULLTYPE = NONE; }

@@ -2,6 +2,8 @@
 *.prj
 *.tdp
 *_Runs/
+log/
+.lock.f
 out/
 bin/
 *.tcl~
