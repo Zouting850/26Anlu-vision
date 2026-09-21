@@ -188,6 +188,22 @@
                     <Attr Name="CompileOrder" Val="30"/>
                 </FileInfo>
             </File>
+            <File Path="src/vision/fire_region_analyzer.v">
+                <FileInfo>
+                    <Attr Name="UsedInSyn" Val="true"/>
+                    <Attr Name="UsedInP&R" Val="true"/>
+                    <Attr Name="BelongTo" Val="design_1"/>
+                    <Attr Name="CompileOrder" Val="33"/>
+                </FileInfo>
+            </File>
+            <File Path="src/vision/fire_detector.v">
+                <FileInfo>
+                    <Attr Name="UsedInSyn" Val="true"/>
+                    <Attr Name="UsedInP&R" Val="true"/>
+                    <Attr Name="BelongTo" Val="design_1"/>
+                    <Attr Name="CompileOrder" Val="32"/>
+                </FileInfo>
+            </File>
             <File Path="src/util/ax_debounce.v">
                 <FileInfo>
                     <Attr Name="UsedInSyn" Val="true"/>
